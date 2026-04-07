@@ -39,6 +39,7 @@ from .compose import (
     compose_build,
     compose_check_running,
     compose_cleanup_images,
+    compose_command,
     compose_cp,
     compose_exec,
     compose_ps,
@@ -357,6 +358,17 @@ class DockerSandboxEnvironment(SandboxEnvironment):
 
         if exec_result.returncode == 126 and "permission denied" in exec_result.stdout:
             raise PermissionError(f"Permission denied executing command: {exec_result}")
+
+        if not exec_result.success and exec_result.stderr.startswith(f'service "{self._service}" is not running'):
+            logs_result = await compose_command(
+                ["logs", "--tail", "100", self._service],
+                project=self._project,
+                timeout=30,
+            )
+            logs = logs_result.stdout or logs_result.stderr
+            raise RuntimeError(
+                f'Service "{self._service}" is not running.\n\nContainer logs:\n{logs}'
+            )
 
         return exec_result
 
