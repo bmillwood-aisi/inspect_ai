@@ -2,7 +2,7 @@ from contextvars import ContextVar
 from copy import deepcopy
 from typing import Any, Literal, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing_extensions import TypedDict
 
 from inspect_ai._util.constants import DEFAULT_BATCH_SIZE
@@ -125,6 +125,9 @@ class GenerateConfigArgs(TypedDict, total=False):
     top_logprobs: int | None
     """Number of most likely tokens (0-20) to return at each token position, each with an associated log probability. OpenAI, Google, Grok, and Huggingface only."""
 
+    prompt_logprobs: int | None
+    """Number of log probabilities to return per prompt token (1-20). When greater than 1, top-N alternative tokens are also returned. vLLM only."""
+
     parallel_tool_calls: bool | None
     """Whether to enable parallel function calling during tool use (defaults to True). OpenAI and Groq only."""
 
@@ -140,11 +143,11 @@ class GenerateConfigArgs(TypedDict, total=False):
     verbosity: Literal["low", "medium", "high"] | None
     """Constrains the verbosity of the model's response. Lower values will result in more concise responses, while higher values will result in more verbose responses. GPT 5.x models only (defaults to "medium" for OpenAI models)."""
 
-    effort: Literal["low", "medium", "high", "max"] | None
-    """Control how many tokens are used for a response, trading off between response thoroughness and token efficiency. Anthropic Claude Opus 4.5 and 4.6 only (`max` only supported on 4.6)."""
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None
+    """Control how many tokens are used for a response, trading off between response thoroughness and token efficiency. Anthropic Claude Opus 4.5+ only (`max` only supported on 4.6 and 4.7, `xhigh` supported only on 4.7)."""
 
     reasoning_effort: (
-        Literal["none", "minimal", "low", "medium", "high", "xhigh"] | None
+        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None
     )
     """Constrains effort on reasoning. Defaults vary by provider and model and not all models support all values (please consult provider documentation for details)."""
 
@@ -233,6 +236,16 @@ class GenerateConfig(BaseModel):
     top_logprobs: int | None = Field(default=None)
     """Number of most likely tokens (0-20) to return at each token position, each with an associated log probability. OpenAI, Grok, Huggingface, vLLM, and SGLang only."""
 
+    prompt_logprobs: int | None = Field(default=None)
+    """Number of log probabilities to return per prompt token (1-20). When greater than 1, top-N alternative tokens are also returned. vLLM only."""
+
+    @field_validator("prompt_logprobs")
+    @classmethod
+    def _validate_prompt_logprobs(cls, v: int | None) -> int | None:
+        if v is not None and (v < 1 or v > 20):
+            raise ValueError("prompt_logprobs must be between 1 and 20")
+        return v
+
     parallel_tool_calls: bool | None = Field(default=None)
     """Whether to enable parallel function calling during tool use (defaults to True). OpenAI and Groq only."""
 
@@ -248,11 +261,13 @@ class GenerateConfig(BaseModel):
     verbosity: Literal["low", "medium", "high"] | None = Field(default=None)
     """Constrains the verbosity of the model's response. Lower values will result in more concise responses, while higher values will result in more verbose responses. GPT 5.x models only (defaults to "medium" for OpenAI models)."""
 
-    effort: Literal["low", "medium", "high", "max"] | None = Field(default=None)
-    """Control how many tokens are used for a response, trading off between response thoroughness and token efficiency. Anthropic Claude Opus 4.5 and 4.6 only (`max` only supported on 4.6)."""
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = Field(
+        default=None
+    )
+    """Control how many tokens are used for a response, trading off between response thoroughness and token efficiency. Anthropic Claude Opus 4.5+ only (`max` only supported on 4.6 and 4.7, `xhigh` supported only on 4.7)."""
 
     reasoning_effort: (
-        Literal["none", "minimal", "low", "medium", "high", "xhigh"] | None
+        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None
     ) = Field(default=None)
     """Constrains effort on reasoning. Defaults vary by provider and model and not all models support all values (please consult provider documentation for details)."""
 
