@@ -87,6 +87,7 @@ async def generate_responses(
     prompt_cache_retention: str | NotGiven,
     safety_identifier: str | NotGiven,
     responses_store: bool | None,
+    synthesize_phase: bool,
     model_info: ResponsesModelInfo,
     batcher: OpenAIBatcher[Response] | None,
     handle_bad_request: Callable[[APIStatusError], ModelOutput | Exception]
@@ -111,7 +112,9 @@ async def generate_responses(
     )
 
     request = dict(
-        input=await openai_responses_inputs(input, model_info),
+        input=await openai_responses_inputs(
+            input, model_info, synthesize_phase=synthesize_phase
+        ),
         tools=tool_params,
         tool_choice=openai_responses_tool_choice(tool_choice, tool_params)
         if isinstance(tool_params, list) and tool_choice != "auto" and len(tools) > 0
@@ -370,7 +373,12 @@ def completion_params_responses(
 
     reasoning: dict[str, str] = {}
     if config.reasoning_effort is not None:
-        reasoning["effort"] = config.reasoning_effort
+        # OpenAI's highest published effort is `xhigh`; map `max` to it so the
+        # request isn't rejected. Mirrors the mapping in
+        # `OpenAIAPI._get_reasoning_params_for_config`.
+        reasoning["effort"] = (
+            "xhigh" if config.reasoning_effort == "max" else config.reasoning_effort
+        )
     if config.reasoning_summary != "none":
         reasoning["summary"] = config.reasoning_summary or "auto"
     if len(reasoning) > 0:

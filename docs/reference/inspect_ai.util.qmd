@@ -24,31 +24,35 @@ description: Miscellaneous utility functions.
 ### SampleLimits
 ### Limit
 ### LimitExceededError
+### suspend_token_limit
 
 ## Concurrency
 
 ### concurrency
 ### subprocess
 ### ExecResult
+### AdaptiveConcurrency
 
 ## Display
 
 ### display_counter
 ### display_type
 ### DisplayType
-### input_screen
 
 ## Utilities
 
 ### span
 ### current_span_id
+### span_id_provider
 ### collect
-### resource
 ### throttle
 ### background
 ### trace_action
 ### trace_message
-
+### media_resolver
+### resource
+### download
+### gdrive_download
 
 ## Sandbox
 
@@ -66,6 +70,14 @@ description: Miscellaneous utility functions.
 ### ExecStdout
 ### ExecStderr
 ### ExecCompleted
+
+## Intervention
+
+### notify
+### request_input
+### InputRequest
+### InputResult
+### InputResult
 
 ## Registry
 

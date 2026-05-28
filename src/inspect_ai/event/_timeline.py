@@ -8,7 +8,7 @@ Uses inspect_ai's event_tree() to parse span structure.
 from __future__ import annotations
 
 import contextlib
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated, Any, AsyncIterator, Callable, Literal, Sequence
 
 from pydantic import (
@@ -27,6 +27,7 @@ from inspect_ai.model import (
     ChatMessageUser,
 )
 
+from ._anchor import AnchorEvent
 from ._branch import BranchEvent
 from ._event import Event
 from ._model import ModelEvent
@@ -47,31 +48,27 @@ def _min_start_time(
 ) -> datetime:
     """Return the earliest start time among nodes.
 
-    Requires at least one node (all nodes have non-null start_time).
-
     Args:
-        nodes: Non-empty sequence of nodes to check.
+        nodes: Sequence of nodes to check.
 
     Returns:
-        The minimum start_time.
+        The minimum start_time, or ``datetime.max`` if empty (so empty
+        spans sort last and ``min()`` callers don't crash).
     """
-    return min(node.start_time() for node in nodes)
+    return min(
+        (node.start_time() for node in nodes),
+        default=datetime.max.replace(tzinfo=timezone.utc),
+    )
 
 
 def _max_end_time(
     nodes: Sequence[TimelineEvent | TimelineSpan],
 ) -> datetime:
-    """Return the latest end time among nodes.
-
-    Requires at least one node (all nodes have non-null end_time).
-
-    Args:
-        nodes: Non-empty sequence of nodes to check.
-
-    Returns:
-        The maximum end_time.
-    """
-    return max(node.end_time() for node in nodes)
+    """Return the latest end time among nodes (``datetime.min`` when empty)."""
+    return max(
+        (node.end_time() for node in nodes),
+        default=datetime.min.replace(tzinfo=timezone.utc),
+    )
 
 
 def _sum_tokens(
@@ -217,12 +214,20 @@ class TimelineSpan(BaseModel):
     type: Literal["span"] = "span"
     id: str
     name: str
-    span_type: str | None
+    span_type: str | None = None
     content: list[TimelineContentItem] = Field(default_factory=list)
     branches: list["TimelineSpan"] = Field(default_factory=list)
     branched_from: str | None = Field(default=None)
     description: str | None = None
     utility: bool = False
+    tool_invoked: bool = False
+    """True if this agent span was invoked as a tool (via task/as_tool/handoff).
+
+    Tool-invoked subagents are explicit user-intended sub-trajectories and
+    are never classified as `utility` regardless of turn count or prompt
+    differences. The `_classify_utility_agents` heuristic targets internal
+    helper model calls, not explicit subagent invocations.
+    """
     agent_result: str | None = None
     outline: "Outline | None" = None
 
@@ -402,10 +407,8 @@ def timeline_build(
 
     **Phase 3 — Post-processing passes:**
 
-    - Auto-branch detection (re-rolled ModelEvents with identical inputs)
     - Utility agent classification (single-turn agents with different
       system prompts)
-    - Recursive branch classification
 
     Args:
         events: Flat list of Events from a transcript.
@@ -426,9 +429,6 @@ def timeline_build(
             description=description,
             root=TimelineSpan(id="root", name="main", span_type=None),
         )
-
-    # Build branch span_id → from_span mapping for relocation
-    from_spans = _build_from_spans(events)
 
     # Use event_tree to get hierarchical structure
     tree = event_tree(events)
@@ -492,7 +492,7 @@ def timeline_build(
         if agent_node is not None:
             agent_node.name = "main"
 
-            _classify_spans(agent_node, from_spans)
+            _classify_spans(agent_node)
 
             # Prepend init span to agent content
             if init_span_obj:
@@ -520,41 +520,37 @@ def timeline_build(
     else:
         # No phase spans - treat entire tree as agent
         root = _build_agent_from_tree(tree)
-        _classify_spans(root, from_spans)
+        _classify_spans(root)
 
     return Timeline(name=name, description=description, root=root)
 
 
 @contextlib.asynccontextmanager
 async def timeline_branch(
-    *, name: str, from_span: str, from_message: str, id: str | None = None
+    *, name: str, from_anchor: str, id: str | None = None
 ) -> AsyncIterator[None]:
     """Context manager for creating a timeline branch.
 
+    Emits an `AnchorEvent` in the current (parent) span so the viewer can resolve `from_anchor` to a position, then opens a ``type="branch"`` span and emits a `BranchEvent` inside it.
+
     Args:
         name (str): Name of branch span.
-        from_span: Span where the branch originated.
-        from_message: Message id at the branch point.
+        from_anchor: Anchor id at the branch point.
         id (str | None): Optional span ID. Generated if not provided.
     """
-    from inspect_ai.event._branch import BranchEvent
     from inspect_ai.log._transcript import transcript
     from inspect_ai.util._span import span
 
+    transcript()._event(AnchorEvent(anchor_id=from_anchor))
     async with span(name=name, type="branch", id=id):
-        transcript()._event(BranchEvent(from_span=from_span, from_message=from_message))
+        transcript()._event(BranchEvent(from_anchor=from_anchor))
         yield
 
 
-def _classify_spans(root: TimelineSpan, from_spans: dict[str, str]) -> None:
-    """Run all span classification passes on a root span.
-
-    Classifies utility agents, branch structure, and relocates branches.
-    """
+def _classify_spans(root: TimelineSpan) -> None:
+    """Run all span classification passes on a root span."""
     _wrap_utility_events(root)
     _classify_utility_agents(root)
-    _classify_branches(root)
-    _relocate_branches(root, from_spans)
     _extract_agent_results(root)
 
 
@@ -700,7 +696,11 @@ def _is_agent_span(span: EventTreeSpan) -> bool:
     """
     if span.type in ("agent", "solver"):
         return True
-    if span.type == "tool" and _contains_model_events(span):
+    if (
+        span.type == "tool"
+        and _contains_model_events(span)
+        and not _contains_agent_span(span)
+    ):
         return True
     return False
 
@@ -751,6 +751,7 @@ def _event_to_node(event: Event) -> TimelineEvent | TimelineSpan:
                 span_type="agent",
                 content=nested_content,
                 agent_result=agent_result,
+                tool_invoked=True,
             )
     return TimelineEvent(event=event)
 
@@ -765,9 +766,17 @@ def _build_span_from_generic_span(
     """
     content, branches = _process_children(span.children)
 
-    # Determine the span_type based on span type and content
+    # Determine the span_type based on span type and content. A tool span
+    # that recursively contains model events is treated as a tool-spawned
+    # agent (e.g. bridge-style tools that emit raw model events). But if
+    # the tool already wraps an explicit agent span, leave the
+    # classification alone — the inner agent span represents the agent.
     span_type: str | None
-    if span.type == "tool" and _contains_model_events(span):
+    if (
+        span.type == "tool"
+        and _contains_model_events(span)
+        and not _contains_agent_span(span)
+    ):
         span_type = "agent"
     else:
         span_type = span.type
@@ -796,6 +805,19 @@ def _contains_model_events(span: EventTreeSpan) -> bool:
                 return True
         elif isinstance(child, ModelEvent):
             return True
+    return False
+
+
+def _contains_agent_span(span: EventTreeSpan) -> bool:
+    """Check if a span has any descendant span with type='agent'.
+
+    Used to suppress tool→agent classification when the tool already
+    wraps an explicit agent span (which will represent the agent itself).
+    """
+    for child in span.children:
+        if isinstance(child, EventTreeSpan):
+            if child.type == "agent" or _contains_agent_span(child):
+                return True
     return False
 
 
@@ -844,6 +866,12 @@ def _unroll_span(
     # Emit span begin event
     into.append(TimelineEvent(event=span.begin))
 
+    # An agent span discovered as a direct child of a tool span being
+    # unrolled was invoked as a tool (task/as_tool/handoff). Mark it so
+    # _classify_utility_agents leaves it alone — tool-invoked subagents
+    # are explicit user intent, not internal helper calls.
+    parent_is_tool = span.type == "tool"
+
     # Process children: recurse into non-agent spans, keep agent spans
     for child in span.children:
         if isinstance(child, EventTreeSpan):
@@ -852,6 +880,8 @@ def _unroll_span(
                 if isinstance(node, TimelineSpan) and not node.content:
                     pass  # skip empty agent spans
                 else:
+                    if parent_is_tool and isinstance(node, TimelineSpan):
+                        node.tool_invoked = True
                     into.append(node)
             else:
                 _unroll_span(child, into)
@@ -865,7 +895,6 @@ def _unroll_span(
 
 def _process_children(
     children: list[TreeItem],
-    from_spans: dict[str, str] | None = None,
 ) -> tuple[list[TimelineEvent | TimelineSpan], list[TimelineSpan]]:
     """Process a span's children with branch awareness.
 
@@ -875,8 +904,6 @@ def _process_children(
 
     Args:
         children: List of tree items to process.
-        from_spans: Optional dict to accumulate branch span_id → from_span
-            mappings for later relocation.
 
     Returns:
         Tuple of (content nodes, branch list).
@@ -913,14 +940,12 @@ def _process_children(
                     branch_content.append(node)
             if not branch_content:
                 continue
-            if from_spans is not None:
-                from_spans[span.id] = branch_event.from_span
             result.append(
                 TimelineSpan(
                     id=span.id,
                     name=span.name or "branch",
                     span_type="branch",
-                    branched_from=branch_event.from_message,
+                    branched_from=branch_event.from_anchor,
                     content=branch_content,
                 )
             )
@@ -981,108 +1006,6 @@ def _process_span_as_content(
             if isinstance(node, TimelineSpan) and not node.content:
                 continue
             into.append(node)
-
-
-def _classify_branches(agent: TimelineSpan) -> None:
-    """Recursively classify branches in the agent tree.
-
-    Recurses into child spans in both content and branches.
-
-    Args:
-        agent: The span node to process.
-    """
-    # Recurse into child spans in content
-    for item in agent.content:
-        if isinstance(item, TimelineSpan):
-            _classify_branches(item)
-
-    # Recurse into spans within branches
-    for branch in agent.branches:
-        for item in branch.content:
-            if isinstance(item, TimelineSpan):
-                _classify_branches(item)
-
-
-# =============================================================================
-# Branch Relocation
-# =============================================================================
-
-
-def _build_from_spans(events: Sequence[Event]) -> dict[str, str]:
-    """Build branch span_id → from_span mapping from BranchEvents.
-
-    Each BranchEvent's span_id identifies the branch span it belongs to,
-    and from_span identifies the span it was forked from.
-
-    Args:
-        events: Flat list of Events from a transcript.
-
-    Returns:
-        Dict mapping branch span_id to the from_span value.
-    """
-    from_spans: dict[str, str] = {}
-    for e in events:
-        if isinstance(e, BranchEvent) and e.span_id:
-            from_spans[e.span_id] = e.from_span
-    return from_spans
-
-
-def _collect_spans(span: TimelineSpan, span_map: dict[str, TimelineSpan]) -> None:
-    """Recursively collect all TimelineSpans into a span_id → span map."""
-    span_map[span.id] = span
-    for item in span.content:
-        if isinstance(item, TimelineSpan):
-            _collect_spans(item, span_map)
-    for branch in span.branches:
-        _collect_spans(branch, span_map)
-
-
-def _relocate_branches(root: TimelineSpan, from_spans: dict[str, str]) -> None:
-    """Relocate branches to the span identified by from_span.
-
-    After initial discovery, all branches from the same _process_children
-    call are flat siblings. If a branch's from_span points to a span
-    inside a sibling branch, move it there.
-
-    Args:
-        root: The root TimelineSpan to process.
-        from_spans: Mapping of branch span_id → from_span (target span_id).
-    """
-    if not from_spans:
-        return
-
-    # Build span_id → TimelineSpan map from entire tree
-    span_map: dict[str, TimelineSpan] = {}
-    _collect_spans(root, span_map)
-
-    # Relocate branches depth-first
-    _do_relocate(root, span_map, from_spans)
-
-
-def _do_relocate(
-    span: TimelineSpan,
-    span_map: dict[str, TimelineSpan],
-    from_spans: dict[str, str],
-) -> None:
-    """Recursively relocate branches in a span and its children."""
-    # Recurse into child spans first (depth-first)
-    for item in span.content:
-        if isinstance(item, TimelineSpan):
-            _do_relocate(item, span_map, from_spans)
-    for branch in span.branches:
-        _do_relocate(branch, span_map, from_spans)
-
-    # Check each branch's from_span and relocate if needed
-    remaining: list[TimelineSpan] = []
-    for branch in span.branches:
-        target_id = from_spans.get(branch.id)
-        target_span = span_map.get(target_id) if target_id else None
-        if target_span is not None and target_span is not span:
-            # Move branch to the target span
-            target_span.branches.append(branch)
-        else:
-            remaining.append(branch)
-    span.branches = remaining
 
 
 # =============================================================================
@@ -1400,8 +1323,15 @@ def _classify_utility_agents(
     """
     agent_system_prompt = _get_system_prompt(node)
 
-    # Classify this node (root agent is never utility)
-    if parent_system_prompt is not None and agent_system_prompt is not None:
+    # Classify this node (root agent is never utility). Tool-invoked
+    # subagents (task/as_tool/handoff) are explicit user-intended
+    # sub-trajectories — never utility — even if single-turn. Foreign-prompt
+    # helper model calls are handled separately by _wrap_utility_events.
+    if (
+        parent_system_prompt is not None
+        and agent_system_prompt is not None
+        and not node.tool_invoked
+    ):
         if agent_system_prompt != parent_system_prompt and _is_single_turn(node):
             node.utility = True
 

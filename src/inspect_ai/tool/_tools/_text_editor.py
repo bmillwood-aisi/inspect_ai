@@ -81,6 +81,8 @@ def text_editor(timeout: int | None = None, user: str | None = None) -> Tool:
     """
     timeout = timeout or 180
 
+    # Keep the undo_edit limit in execute()'s docstring in sync with
+    # MAX_HISTORY_ENTRIES_PER_FILE in the sandbox text_editor implementation.
     async def execute(
         command: Literal["view", "create", "str_replace", "insert", "undo_edit"],
         path: str,
@@ -95,7 +97,7 @@ def text_editor(timeout: int | None = None, user: str | None = None) -> Tool:
         Use this function to execute text editing commands.
 
         Args:
-          command: The command to execute.
+          command: The command to execute. Note: `undo_edit` retains only the last 10 edits per file.
           path: Path to file or directory, e.g. `/repo/file.py` or `../repo`.
           file_text: Required parameter of `create` command, with the content of the file to be created.
           insert_line: Required parameter of `insert` command. The `new_str` will be inserted AFTER the line `insert_line` of `path`.
@@ -120,6 +122,10 @@ def text_editor(timeout: int | None = None, user: str | None = None) -> Tool:
             if k in inspect.signature(execute).parameters
         }
 
+        # Pass user via reserved param for CLI-side setuid (in-process tool)
+        if user is not None:
+            params["_run_as_user"] = user
+
         return await exec_scalar_request(
             method="text_editor",
             params=params,
@@ -127,7 +133,7 @@ def text_editor(timeout: int | None = None, user: str | None = None) -> Tool:
             transport=SandboxJSONRPCTransport(sandbox, SANDBOX_CLI),
             error_mapper=SandboxToolsErrorMapper,
             timeout=timeout,
-            user=user,
+            user=sandbox._tools_user,
         )
 
     return execute
